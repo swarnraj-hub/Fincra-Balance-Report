@@ -1,0 +1,61 @@
+name: Fincra Balance Report
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: "From Date (YYYY-MM-DD) — sourced from Google Sheets via n8n"
+        required: true
+        type: string
+      end_date:
+        description: "To Date (YYYY-MM-DD) — sourced from Google Sheets via n8n"
+        required: true
+        type: string
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install playwright pyotp requests
+          playwright install chromium --with-deps
+
+      - name: Run Fincra Balance Report export
+        env:
+          FINCRA_USERNAME:    ${{ secrets.FINCRA_USERNAME }}
+          FINCRA_PASSWORD:    ${{ secrets.FINCRA_PASSWORD }}
+          FINCRA_TOTP_SECRET: ${{ secrets.FINCRA_TOTP_SECRET }}
+          SLACK_BOT_TOKEN:    ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_USER_ID:      ${{ secrets.SLACK_USER_ID }}
+          CI: "true"
+        run: |
+          python fincra_balance_report.py \
+            --start_date "${{ github.event.inputs.start_date }}" \
+            --end_date   "${{ github.event.inputs.end_date }}"
+
+      - name: Upload CSV as artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fincra-balance-report-${{ github.event.inputs.start_date }}-to-${{ github.event.inputs.end_date }}
+          path: downloads/FINCRA_PAYIN_*.csv
+          retention-days: 30
+
+      - name: Upload screenshots on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: fincra_payin_*.png
+          retention-days: 7
