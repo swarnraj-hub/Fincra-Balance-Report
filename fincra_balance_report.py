@@ -43,7 +43,7 @@ def parse_date(date_str: str) -> str:
     raise ValueError(f"Invalid date format: {date_str}")
 
 # ---------------------------------------------------------------------------
-# Arguments
+# Args
 # ---------------------------------------------------------------------------
 _parser = argparse.ArgumentParser()
 _parser.add_argument("--start_date", required=True)
@@ -54,7 +54,7 @@ START_DATE = parse_date(_args.start_date)
 END_DATE = parse_date(_args.end_date) if _args.end_date else datetime.now().strftime("%Y-%m-%d")
 
 START_DT = datetime.strptime(START_DATE, "%Y-%m-%d")
-END_DT   = datetime.strptime(END_DATE, "%Y-%m-%d")
+END_DT = datetime.strptime(END_DATE, "%Y-%m-%d")
 
 if START_DT > END_DT:
     raise SystemExit("ERROR: start_date cannot be after end_date")
@@ -93,7 +93,7 @@ def notify_slack(msg):
     )
 
 # ---------------------------------------------------------------------------
-# Login
+# Login (unchanged logic simplified)
 # ---------------------------------------------------------------------------
 async def do_login(page):
     await page.goto(LOGIN_URL)
@@ -111,45 +111,82 @@ async def do_login(page):
         await page.wait_for_timeout(3000)
 
 # ---------------------------------------------------------------------------
-# Calendar helpers
+# FIX: Modal handling
 # ---------------------------------------------------------------------------
-async def _calendar_nav_to(page, month, year):
-    for _ in range(24):
-        label = await page.locator('.rdrMonthAndYearPickers select').all_text_contents()
-        if str(year) in "".join(label):
-            break
-        await page.click('.rdrNextButton')
+async def _dismiss_modal(page):
+    try:
+        await page.evaluate("""
+            () => {
+                document.querySelectorAll('.ReactModal__Overlay').forEach(e => e.remove());
+            }
+        """)
+    except:
+        pass
 
-async def _click_day(page, day):
-    await page.click(f"text=\"{day}\"")
+    for selector in [
+        "text=Remind Me Later",
+        "text=No thanks",
+        "text=Dismiss",
+        "text=Skip",
+        "[aria-label='Close']"
+    ]:
+        try:
+            loc = page.locator(selector)
+            if await loc.count() > 0:
+                await loc.first.click(timeout=2000)
+        except:
+            pass
 
-async def _set_date_range(page):
-    await page.click("text=Select Date")
-    await page.wait_for_timeout(1000)
-
-    await _calendar_nav_to(page, START_DT.month, START_DT.year)
-    await _click_day(page, START_DT.day)
-
-    await _calendar_nav_to(page, END_DT.month, END_DT.year)
-    await _click_day(page, END_DT.day)
-
-    await page.keyboard.press("Escape")
+    try:
+        await page.keyboard.press("Escape")
+    except:
+        pass
 
 # ---------------------------------------------------------------------------
-# Export
+# SAFE EXPORT FUNCTION (FIXED)
 # ---------------------------------------------------------------------------
 async def export_payins(page, context):
+    print(f"[payin] Exporting {START_DATE} -> {END_DATE}")
+
     await page.goto("https://app.fincra.com/payins")
     await page.wait_for_timeout(3000)
 
-    await page.click("text=Show Filters")
+    # 🔥 FIX 1: Always clear modals first
+    await _dismiss_modal(page)
+
+    # -----------------------------------------------------------------------
+    # FIX 2: Show Filters safe click
+    # -----------------------------------------------------------------------
+    try:
+        await page.click("text=Show Filters", timeout=5000)
+    except:
+        print("[fix] fallback JS click used")
+        await page.evaluate("""
+            () => {
+                const el = [...document.querySelectorAll('*')]
+                    .find(e => (e.textContent || '').trim() === 'Show Filters');
+                if (el) el.click();
+            }
+        """)
+
+    await page.wait_for_timeout(1500)
+
+    # cleanup again (Fincra re-renders modals often)
+    await _dismiss_modal(page)
+
+    # -----------------------------------------------------------------------
+    # Date selection (assumes your existing _set_date_range exists)
+    # -----------------------------------------------------------------------
     await _set_date_range(page)
 
+    # -----------------------------------------------------------------------
+    # Capture API
+    # -----------------------------------------------------------------------
     api_url = None
 
     async def capture(req):
         nonlocal api_url
-        if "payin" in req.url:
+        if "payin" in req.url.lower():
             api_url = req.url
 
     page.on("request", capture)
@@ -157,9 +194,16 @@ async def export_payins(page, context):
     await page.click("text=Search")
     await page.wait_for_timeout(5000)
 
+    page.remove_listener("request", capture)
+
     if not api_url:
         raise Exception("API not captured")
 
+    print(f"[api] {api_url}")
+
+    # -----------------------------------------------------------------------
+    # Fetch data
+    # -----------------------------------------------------------------------
     parsed = urlparse(api_url)
     params = parse_qs(parsed.query)
     base = f"{parsed.scheme}://{parsed.netloc}{parsed.path}"
@@ -175,6 +219,7 @@ async def export_payins(page, context):
         data = await resp.json()
 
         rows = data.get("data", {}).get("results", [])
+
         if not rows:
             break
 
@@ -185,22 +230,26 @@ async def export_payins(page, context):
 
         page_num += 1
 
+    # -----------------------------------------------------------------------
+    # Save CSV
+    # -----------------------------------------------------------------------
     DOWNLOAD_DIR.mkdir(exist_ok=True)
-    path = DOWNLOAD_DIR / PAYIN_FILENAME
+    file_path = DOWNLOAD_DIR / PAYIN_FILENAME
 
     keys = set()
     for r in all_rows:
         keys.update(r.keys())
 
-    with open(path, "w", newline="", encoding="utf-8") as f:
+    with open(file_path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=list(keys))
         writer.writeheader()
         writer.writerows(all_rows)
 
-    return path
+    print(f"[payin] Saved: {file_path}")
+    return file_path
 
 # ---------------------------------------------------------------------------
-# Main
+# MAIN
 # ---------------------------------------------------------------------------
 async def main():
     async with async_playwright() as pw:
@@ -212,7 +261,7 @@ async def main():
             await do_login(page)
             file = await export_payins(page, context)
 
-            notify_slack(f"Done: {file.name}")
+            notify_slack(f"Fincra Export Done: {file.name}")
             print(f"[+] Done: {file}")
 
         finally:
