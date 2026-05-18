@@ -7,16 +7,18 @@ Date logic:
   - To Date   : --end_date arg (optional, defaults to today)
 
 Usage:
-    python fincra_payin.py --start_date 2026-04-01
-    python fincra_payin.py --start_date 2026-04-01 --end_date 2026-05-04
+    python fincra_balance_report.py --start_date 2026-04-01
+    python fincra_balance_report.py --start_date 2026-04-01 --end_date 2026-05-04
 """
 
 import argparse
 import asyncio
+import boto3
 import csv
 import os
 import pyotp
 import requests
+from botocore.exceptions import BotoCoreError, ClientError
 from datetime import datetime
 from pathlib import Path
 from urllib.parse import urlparse, parse_qs, urlencode
@@ -66,6 +68,12 @@ TOTP_SECRET     = os.environ.get("FINCRA_TOTP_SECRET", "")
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
 SLACK_USER_ID   = os.environ.get("SLACK_USER_ID", "")
 
+AWS_ACCESS_KEY_ID     = os.environ.get("AWS_ACCESS_KEY_ID", "")
+AWS_SECRET_ACCESS_KEY = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+AWS_REGION            = os.environ.get("AWS_REGION", "ap-southeast-1")
+S3_BUCKET             = os.environ.get("S3_BUCKET", "payout-recon")
+S3_PREFIX             = os.environ.get("S3_PREFIX", "fincra/collect/raw/")
+
 
 def to_file_date(d: datetime) -> str:
     return d.strftime("%d%m%Y")
@@ -113,6 +121,28 @@ def notify_slack(message: str, color: str = "good") -> None:
         print("[slack] DM sent.")
     except Exception as e:
         print(f"[slack] Failed: {e}")
+
+
+# ---------------------------------------------------------------------------
+# S3 Upload
+# ---------------------------------------------------------------------------
+def upload_to_s3(local_path: Path) -> str:
+    s3_key = f"{S3_PREFIX}{local_path.name}"
+    print(f"[s3] Uploading {local_path.name} -> s3://{S3_BUCKET}/{s3_key} ...")
+    try:
+        client = boto3.client(
+            "s3",
+            region_name=AWS_REGION,
+            aws_access_key_id=AWS_ACCESS_KEY_ID,
+            aws_secret_access_key=AWS_SECRET_ACCESS_KEY,
+        )
+        client.upload_file(str(local_path), S3_BUCKET, s3_key)
+        s3_uri = f"s3://{S3_BUCKET}/{s3_key}"
+        print(f"[s3] Upload complete: {s3_uri}")
+        return s3_uri
+    except (BotoCoreError, ClientError) as e:
+        print(f"[s3] Upload failed: {e}")
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -219,141 +249,38 @@ async def _dismiss_survey(page) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Calendar helpers
+# Capture auth token from page auto-load (no calendar interaction needed)
 # ---------------------------------------------------------------------------
-async def _calendar_nav_to(page, target_month: int, target_year: int) -> None:
-    set_ok = await page.evaluate(f"""() => {{
-        const cal = document.querySelector(
-            '.rdrCalendarWrapper, .rdrDateRangeWrapper, .rdrDateRangePickerWrapper');
-        if (!cal) return false;
-        const selects = cal.querySelectorAll('select');
-        let mSet = false, ySet = false;
-        for (const s of selects) {{
-            const html = s.innerHTML;
-            if (html.includes('value="0"') && html.includes('value="11"')) {{
-                s.value = String({target_month - 1});
-                s.dispatchEvent(new Event('change', {{bubbles: true}}));
-                mSet = true;
-            }} else if (s.options.length >= 3) {{
-                const y = parseInt(s.value);
-                if (y > 2000 && y < 2100) {{
-                    s.value = String({target_year});
-                    s.dispatchEvent(new Event('change', {{bubbles: true}}));
-                    ySet = true;
-                }}
-            }}
-        }}
-        return mSet && ySet;
-    }}""")
-    if set_ok:
-        await page.wait_for_timeout(300)
-        print(f"[cal] Set calendar to {target_month}/{target_year} via JS selects")
-        return
+async def capture_auth_token(page) -> dict:
+    """
+    Navigate to the payins page and capture the auth token + base API URL
+    from the automatic data load the page triggers on mount.
+    This works identically in headed and headless mode — no calendar UI needed.
+    """
+    print("[payin] Navigating to payins page to capture auth token ...")
+    api_calls: list[dict] = []
 
-    now = datetime.now()
-    months_diff = (now.year - target_year) * 12 + (now.month - target_month)
-    print(f"[cal] Navigating {months_diff} months via arrows")
-    for _ in range(abs(months_diff)):
-        if months_diff > 0:
-            btn = page.locator('.rdrPprevButton, .rdrPrevButton')
-            if await btn.count() == 0:
-                btn = page.locator('button[aria-label*="previous" i]')
-        else:
-            btn = page.locator('.rdrNextButton')
-            if await btn.count() == 0:
-                btn = page.locator('button[aria-label*="next" i]')
-        if await btn.count() > 0:
-            await btn.first.click()
-            await page.wait_for_timeout(300)
-        else:
-            break
+    async def capture_request(request):
+        if '/api/' in request.url and request.method in ('GET', 'POST'):
+            if any(k in request.url.lower() for k in ('collection', 'payin', 'pay-in', 'pay_in')):
+                try:
+                    hdrs = dict(await request.all_headers())
+                except Exception:
+                    hdrs = {}
+                api_calls.append({'url': request.url, 'headers': hdrs})
 
+    page.on("request", capture_request)
+    await page.goto("https://app.fincra.com/payins", wait_until="domcontentloaded", timeout=30_000)
+    await page.wait_for_timeout(4_000)
+    await _dismiss_survey(page)
+    page.remove_listener("request", capture_request)
 
-async def _click_calendar_day(page, day: int) -> bool:
-    day_str = str(day)
-    for cal_sel in ['.rdrCalendarWrapper', '.rdrDateRangeWrapper', '.rdrDateRangePickerWrapper']:
-        cal = page.locator(cal_sel)
-        if await cal.count() > 0:
-            for tag in ['button', 'td', 'span', 'div']:
-                candidates = cal.locator(tag).filter(has_text=day_str)
-                for i in range(await candidates.count()):
-                    el = candidates.nth(i)
-                    if (await el.text_content() or "").strip() != day_str:
-                        continue
-                    try:
-                        await el.click(timeout=3_000)
-                        print(f"[cal] Clicked day {day_str}")
-                        return True
-                    except Exception:
-                        continue
-    result = await page.evaluate(f"""() => {{
-        const cal = document.querySelector(
-            '.rdrCalendarWrapper, .rdrDateRangeWrapper, .rdrDateRangePickerWrapper') || document;
-        for (const el of cal.querySelectorAll('button, td, span, div')) {{
-            if ((el.textContent || '').trim() === '{day_str}' && el.offsetParent !== null) {{
-                el.click(); return true;
-            }}
-        }}
-        return false;
-    }}""")
-    return bool(result)
+    if not api_calls:
+        raise RuntimeError("[payin] Could not capture API call from payins page load")
 
-
-async def _is_calendar_open(page) -> bool:
-    return await page.locator(
-        '.rdrCalendarWrapper, .rdrDateRangeWrapper, .rdrDateRangePickerWrapper'
-    ).count() > 0
-
-
-async def _click_date_dropdown(page, index: int) -> None:
-    await page.evaluate(f"""() => {{
-        const els = Array.from(document.querySelectorAll('*'))
-            .filter(el => (el.textContent || '').trim() === 'Select Date'
-                       && el.offsetParent !== null);
-        const el = els[{index}];
-        if (el) {{
-            const target = el.closest('button, [role="button"], [class*="select"], [class*="dropdown"], [class*="picker"]')
-                        || el.parentElement || el;
-            target.click();
-        }}
-    }}""")
-
-
-async def _set_date_range(page, label: str = "") -> None:
-    pfx = f"[{label}]"
-    count = await page.evaluate("""() =>
-        Array.from(document.querySelectorAll('*'))
-            .filter(el => (el.textContent || '').trim() === 'Select Date'
-                       && el.offsetParent !== null).length""")
-    print(f"{pfx} Visible 'Select Date' dropdowns: {count}")
-
-    print(f"{pfx} Opening From date picker ...")
-    await _click_date_dropdown(page, 0)
-    await page.wait_for_timeout(1_200)
-    if not await _is_calendar_open(page):
-        await page.get_by_text("Select Date", exact=True).first.click(timeout=5_000)
-        await page.wait_for_timeout(1_200)
-
-    await _calendar_nav_to(page, START_DT.month, START_DT.year)
-    await _click_calendar_day(page, START_DT.day)
-    await page.wait_for_timeout(600)
-    if await _is_calendar_open(page):
-        await page.keyboard.press("Escape")
-        await page.wait_for_timeout(400)
-
-    print(f"{pfx} Opening To date picker ...")
-    await _click_date_dropdown(page, 0)
-    await page.wait_for_timeout(1_200)
-    if not await _is_calendar_open(page):
-        await page.get_by_text("Select Date", exact=True).first.click(timeout=5_000)
-        await page.wait_for_timeout(1_200)
-
-    await _calendar_nav_to(page, END_DT.month, END_DT.year)
-    await _click_calendar_day(page, END_DT.day)
-    await page.wait_for_timeout(600)
-    if await _is_calendar_open(page):
-        await page.keyboard.press("Escape")
-        await page.wait_for_timeout(400)
+    data_call = api_calls[0]
+    print(f"[payin] Captured API endpoint: {data_call['url']}")
+    return data_call
 
 
 # ---------------------------------------------------------------------------
@@ -362,84 +289,10 @@ async def _set_date_range(page, label: str = "") -> None:
 async def export_payins(page, context) -> Path:
     print(f"\n[payin] Exporting {START_DATE} -> {END_DATE} ...")
 
-    await page.goto("https://app.fincra.com/payins", wait_until="domcontentloaded", timeout=30_000)
-    await page.wait_for_timeout(2_500)
-    await _dismiss_survey(page)
     await ss(page, "01_payins_page")
 
-    print("[payin] Clicking Show Filters ...")
-    clicked = False
-    try:
-        await page.get_by_text("Show Filters").click(timeout=8_000)
-        clicked = True
-    except Exception:
-        pass
-    if not clicked:
-        await page.evaluate("""() => {
-            const el = [...document.querySelectorAll('*')]
-                .find(e => (e.textContent || '').trim() === 'Show Filters'
-                        && e.offsetParent !== null);
-            if (el) (el.closest('button,[role="button"]') || el.parentElement || el).click();
-        }""")
-    await page.wait_for_timeout(1_500)
-    await ss(page, "02_filters_open")
-
-    print("[payin] Setting date range ...")
-    await _set_date_range(page, label="payin")
-
-    await page.keyboard.press("Escape")
-    await page.wait_for_timeout(300)
-    try:
-        await page.locator('h1').first.click(timeout=2_000)
-    except Exception:
-        pass
-    await page.wait_for_timeout(500)
-
-    api_calls: list[dict] = []
-
-    async def capture_request(request):
-        if '/api/' in request.url and request.method in ('GET', 'POST'):
-            try:
-                hdrs = dict(await request.all_headers())
-            except Exception:
-                hdrs = {}
-            api_calls.append({'url': request.url, 'headers': hdrs})
-
-    page.on("request", capture_request)
-
-    print("[payin] Clicking Search ...")
-    searched = False
-    for sel in ['button:has-text("Search")', 'text=Search']:
-        loc = page.locator(sel)
-        if await loc.count() > 0:
-            try:
-                await loc.first.click(timeout=8_000)
-                searched = True
-                break
-            except Exception:
-                continue
-    if not searched:
-        await page.evaluate("""() => {
-            for (const btn of document.querySelectorAll('button')) {
-                if ((btn.textContent || '').trim().startsWith('Search')) {
-                    btn.click(); return;
-                }
-            }
-        }""")
-
-    await page.wait_for_timeout(5_000)
-    await ss(page, "03_after_search")
-    page.remove_listener("request", capture_request)
-
-    data_call = next(
-        (c for c in api_calls if any(k in c['url'].lower()
-         for k in ('payin', 'collection', 'pay-in', 'pay_in'))),
-        api_calls[0] if api_calls else None,
-    )
-    if not data_call:
-        raise RuntimeError("[payin] Could not find data API endpoint")
-
-    print(f"[payin] API endpoint: {data_call['url']}")
+    data_call = await capture_auth_token(page)
+    await ss(page, "02_captured_token")
 
     parsed   = urlparse(data_call['url'])
     params   = parse_qs(parsed.query, keep_blank_values=True)
@@ -450,12 +303,16 @@ async def export_payins(page, context) -> Path:
         (k for k in params if k.lower() in ('perpage', 'per_page', 'limit', 'pagesize')), 'perPage')
     page_key = next((k for k in params if k.lower() == 'page'), 'page')
 
-    for k in list(params):
-        kl = k.lower()
-        if kl in ('dateinitiatedfrom', 'startdate', 'start_date', 'from', 'datefrom'):
-            params[k] = [START_DATE]
-        elif kl in ('dateinitiatedto', 'enddate', 'end_date', 'to', 'dateto'):
-            params[k] = [END_DATE]
+    # Override dates with the requested range
+    date_from_key = next(
+        (k for k in params if k.lower() in ('dateinitiatedfrom', 'startdate', 'start_date', 'from', 'datefrom')),
+        'dateInitiatedFrom')
+    date_to_key = next(
+        (k for k in params if k.lower() in ('dateinitiatedto', 'enddate', 'end_date', 'to', 'dateto')),
+        'dateInitiatedTo')
+
+    params[date_from_key] = [START_DATE]
+    params[date_to_key]   = [END_DATE]
 
     all_rows: list[dict] = []
     page_num, per_page = 1, 100
@@ -521,7 +378,7 @@ async def export_payins(page, context) -> Path:
         writer.writerows(all_rows)
 
     print(f"[payin] Saved {len(all_rows)} records -> {dest.resolve()}")
-    await ss(page, "04_done")
+    await ss(page, "03_done")
     return dest
 
 
@@ -546,12 +403,15 @@ async def main() -> None:
         try:
             await do_login(page)
             dest = await export_payins(page, context)
+            s3_uri = upload_to_s3(dest)
             notify_slack(
                 f":white_check_mark: *Fincra Pay-In Export Complete*\n"
                 f"Period: `{START_DATE}` -> `{END_DATE}`\n"
-                f"File: `{dest.name}` ({dest.stat().st_size // 1024} KB)"
+                f"File: `{dest.name}` ({dest.stat().st_size // 1024} KB)\n"
+                f"S3: `{s3_uri}`"
             )
             print(f"\n[+] Done! File: {dest.resolve()}")
+            print(f"[+] S3:   {s3_uri}")
         except Exception as exc:
             msg = f"Fincra Pay-In FAILED\nPeriod: {START_DATE} -> {END_DATE}\nError: {exc}"
             print(f"\n[!] {msg}")
