@@ -1,16 +1,20 @@
-name: Fincra Balance Report
+name: Fincra Pay-In Export
 
 on:
   workflow_dispatch:
     inputs:
       start_date:
-        description: "From Date (YYYY-MM-DD) — sourced from Google Sheets via n8n"
+        description: "From Date (YYYY-MM-DD)"
         required: true
         type: string
       end_date:
-        description: "To Date (YYYY-MM-DD) — optional (defaults to today)"
+        description: "To Date (YYYY-MM-DD) — leave blank to default to today"
         required: false
         type: string
+
+  # Optional: run automatically every weekday at 09:00 UTC
+  # schedule:
+  #   - cron: "0 9 * * 1-5"
 
 jobs:
   export:
@@ -18,61 +22,42 @@ jobs:
     timeout-minutes: 20
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install playwright pyotp requests boto3
+          pip install --upgrade pip
+          pip install playwright pyotp requests
           playwright install chromium --with-deps
 
-      - name: Run Fincra Balance Report export
+      - name: Run export
         env:
-          FINCRA_USERNAME:       ${{ secrets.FINCRA_USERNAME }}
-          FINCRA_PASSWORD:       ${{ secrets.FINCRA_PASSWORD }}
-          FINCRA_TOTP_SECRET:    ${{ secrets.FINCRA_TOTP_SECRET }}
-          SLACK_BOT_TOKEN:       ${{ secrets.SLACK_BOT_TOKEN }}
-          SLACK_USER_ID:         ${{ secrets.SLACK_USER_ID }}
-          AWS_ACCESS_KEY_ID:     ${{ secrets.AWS_ACCESS_KEY_ID }}
-          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          AWS_REGION:            ap-southeast-1
-          S3_BUCKET:             payout-recon
-          S3_PREFIX:             fincra/collect/raw/
+          FINCRA_USERNAME:    ${{ secrets.FINCRA_USERNAME }}
+          FINCRA_PASSWORD:    ${{ secrets.FINCRA_PASSWORD }}
+          FINCRA_TOTP_SECRET: ${{ secrets.FINCRA_TOTP_SECRET }}
+          SLACK_BOT_TOKEN:    ${{ secrets.SLACK_BOT_TOKEN }}
+          SLACK_USER_ID:      ${{ secrets.SLACK_USER_ID }}
           CI: "true"
         run: |
-          echo "======================================="
-          echo "Fincra Balance Report Execution"
-          echo "Start Date: ${{ github.event.inputs.start_date }}"
-          echo "End Date:   ${{ github.event.inputs.end_date || 'today (auto)' }}"
-          echo "======================================="
+          START="${{ github.event.inputs.start_date }}"
+          END="${{ github.event.inputs.end_date }}"
 
-          if [ -z "${{ github.event.inputs.end_date }}" ]; then
-            python fincra_balance_report.py \
-              --start_date "${{ github.event.inputs.start_date }}"
+          if [ -z "$END" ]; then
+            python fincra_balance_report.py --start_date "$START"
           else
-            python fincra_balance_report.py \
-              --start_date "${{ github.event.inputs.start_date }}" \
-              --end_date   "${{ github.event.inputs.end_date }}"
+            python fincra_balance_report.py --start_date "$START" --end_date "$END"
           fi
 
-      - name: Upload CSV as artifact
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: fincra-balance-report-${{ github.event.inputs.start_date }}-to-${{ github.event.inputs.end_date || 'today' }}
-          path: downloads/FINCRA_PAYIN_*.csv
-          retention-days: 30
-
-      - name: Upload screenshots on failure
+      - name: Upload debug screenshots on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
           name: debug-screenshots
-          path: fincra_payin_*.png
+          path: fincra_*.png
           retention-days: 7
